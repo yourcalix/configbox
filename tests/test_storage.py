@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import importlib
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+
+def load_modules(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    claude_path = tmp_path / "config" / "claude" / "settings.json"
+    codex_path = tmp_path / "config" / "codex" / "auth.json"
+    codex_toml_path = tmp_path / "config" / "codex" / "config.toml"
+    claude_path.parent.mkdir(parents=True)
+    codex_path.parent.mkdir(parents=True)
+    claude_path.write_text('{"model": "sonnet"}\n', encoding="utf-8")
+    codex_path.write_text('{"OPENAI_API_KEY": "test"}\n', encoding="utf-8")
+    codex_toml_path.write_text('model = "gpt-5"\n', encoding="utf-8")
+
+    os.environ["DATA_DIR"] = str(data_dir)
+    os.environ["CLAUDE_CONFIG_PATH"] = str(claude_path)
+    os.environ["CODEX_CONFIG_PATH"] = str(codex_path)
+    os.environ["CODEX_CONFIG_TOML_PATH"] = str(codex_toml_path)
+    os.environ["BACKUP_RETENTION"] = "50"
+
+    for name in list(sys.modules):
+        if name == "app" or name.startswith("app."):
+            sys.modules.pop(name)
+
+    registry = importlib.import_module("app.registry")
+    storage = importlib.import_module("app.storage")
+    errors = importlib.import_module("app.errors")
+    storage.ensure_all()
+    return registry, storage, errors, claude_path, codex_path, codex_toml_path, data_dir
+
+
+def test_invalid_tool_rejected(tmp_path: Path):
+    registry, _, errors, *_ = load_modules(tmp_path)
+    with pytest.raises(errors.InvalidToolError):
+        registry.get_tool("evil")
+
+
+def test_invalid_profile_name_rejected(tmp_path: Path):
+    registry, storage, errors, *_ = load_modules(tmp_path)
+    with pytest.raises(errors.APIError) as exc:
+        storage.create_profile(registry.get_tool("claude"), "../evil", "active")
+    assert exc.value.code == "INVALID_PROFILE_NAME"
+
+
+def test_invalid_json_rejected(tmp_path: Path):
+    registry, storage, errors, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    mtime = storage.file_mtime(tool.active_path)
+    with pytest.raises(errors.APIError) as exc:
+        storage.save_active(tool, "{bad", mtime)
+    assert exc.value.code == "INVALID_JSON"
+
+
+def test_invalid_codex_json_rejected(tmp_path: Path):
+    registry, storage, errors, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("codex")
+    mtime = storage.file_mtime(tool.active_path)
+    with pytest.raises(errors.APIError) as exc:
+        storage.save_active(tool, "{bad", mtime)
+    assert exc.value.code == "INVALID_JSON"
+
+
+def test_save_active_creates_backup(tmp_path: Path):
+    registry, storage, _, claude_path, *_, data_dir = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    storage.save_active(tool, '{"model": "opus"}\n', storage.file_mtime(tool.active_path))
+
+    assert claude_path.read_text(encoding="utf-8") == '{"model": "opus"}\n'
+    backups = list((data_dir / "backups" / "claude").glob("*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == '{"model": "sonnet"}\n'
+
+
+def test_activate_profile_overwrites_active(tmp_path: Path):
+    registry, storage, _, claude_path, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    storage.create_profile(tool, "proxy", "empty")
+    storage.save_profile(tool, "proxy", '{"env": {"HTTPS_PROXY": "http://127.0.0.1:7890"}}\n')
+    storage.activate_profile(tool, "proxy")
+
+    assert "HTTPS_PROXY" in claude_path.read_text(encoding="utf-8")
+
+
+def test_external_mtime_conflict(tmp_path: Path):
+    registry, storage, errors, claude_path, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("claude")
+    old_mtime = storage.file_mtime(tool.active_path)
+    claude_path.write_text('{"external": true}\n', encoding="utf-8")
+
+    with pytest.raises(errors.APIError) as exc:
+        storage.save_active(tool, '{"model": "opus"}\n', old_mtime)
+    assert exc.value.code == "CONFLICT_MODIFIED_EXTERNALLY"
+
+
+def test_codex_profile_pairs_auth_json_and_config_toml(tmp_path: Path):
+    registry, storage, _, _, codex_path, codex_toml_path, data_dir = load_modules(tmp_path)
+    tool = registry.get_tool("codex")
+
+    storage.create_profile(tool, "deepseek", "active")
+    storage.save_profile(
+        tool,
+        "deepseek",
+        None,
+        [
+            {"id": "auth", "content": '{"OPENAI_API_KEY": "deepseek"}\n'},
+            {"id": "config", "content": 'model = "deepseek-chat"\n'},
+        ],
+    )
+    storage.activate_profile(tool, "deepseek")
+
+    assert codex_path.read_text(encoding="utf-8") == '{"OPENAI_API_KEY": "deepseek"}\n'
+    assert codex_toml_path.read_text(encoding="utf-8") == 'model = "deepseek-chat"\n'
+    assert (data_dir / "profiles" / "codex" / "deepseek" / "auth.json").exists()
+    assert (data_dir / "profiles" / "codex" / "deepseek" / "config.toml").exists()
+    assert any(path.is_dir() for path in (data_dir / "backups" / "codex").iterdir())
+
+
+def test_invalid_codex_toml_rejected(tmp_path: Path):
+    registry, storage, errors, *_ = load_modules(tmp_path)
+    tool = registry.get_tool("codex")
+    with pytest.raises(errors.APIError) as exc:
+        storage.save_profile(tool, "default", None, [{"id": "config", "content": "bad = ["}])
+    assert exc.value.code == "INVALID_TOML"
+
+
+def test_password_hash_verification(tmp_path: Path):
+    load_modules(tmp_path)
+    auth = importlib.import_module("app.auth")
+    password_hash = auth.generate_password_hash("secret")
+    os.environ["APP_PASSWORD"] = ""
+    os.environ["APP_PASSWORD_HASH"] = password_hash
+
+    assert auth.verify_password("secret")
+    assert not auth.verify_password("wrong")
+
+
+def test_password_hash_verification_accepts_compose_escaped_dollars(tmp_path: Path):
+    load_modules(tmp_path)
+    auth = importlib.import_module("app.auth")
+    password_hash = auth.generate_password_hash("secret")
+    os.environ["APP_PASSWORD"] = ""
+    os.environ["APP_PASSWORD_HASH"] = auth.compose_env_escape(password_hash)
+
+    assert "$$" in os.environ["APP_PASSWORD_HASH"]
+    assert auth.verify_password("secret")
+    assert not auth.verify_password("wrong")
+
+
+def test_password_hash_tool_updates_env_text(tmp_path: Path):
+    load_modules(tmp_path)
+    password_hash = importlib.import_module("app.password_hash")
+
+    updated = password_hash.update_env_text(
+        "# keep me\n"
+        "UID=1000\n"
+        "APP_PASSWORD=old\n"
+        "APP_PASSWORD_HASH=old-hash\n"
+        "SESSION_SECRET=old-secret\n"
+        "TZ=Asia/Shanghai\n",
+        {
+            "APP_PASSWORD": "",
+            "APP_PASSWORD_HASH": "pbkdf2_sha256$$260000$$salt$$digest",
+            "SESSION_SECRET": "new-secret",
+        },
+    )
+
+    assert "# keep me\n" in updated
+    assert "UID=1000\n" in updated
+    assert "APP_PASSWORD=\n" in updated
+    assert "APP_PASSWORD_HASH=pbkdf2_sha256$$260000$$salt$$digest\n" in updated
+    assert "SESSION_SECRET=new-secret\n" in updated
+    assert "TZ=Asia/Shanghai\n" in updated
+    assert "old-hash" not in updated
+
+
+def test_password_hash_tool_prints_manual_values_on_write_failure(tmp_path: Path, capsys, monkeypatch):
+    load_modules(tmp_path)
+    password_hash = importlib.import_module("app.password_hash")
+
+    monkeypatch.setattr("sys.argv", ["password_hash", "--env-file", str(tmp_path)])
+    monkeypatch.setattr("getpass.getpass", lambda _prompt: "secret")
+
+    with pytest.raises(SystemExit) as exc:
+        password_hash.main()
+
+    captured = capsys.readouterr()
+    assert exc.value.code == 1
+    assert "Failed to update" in captured.err
+    assert "Please manually write these lines to your .env file:" in captured.err
+    assert "APP_PASSWORD=\n" in captured.out
+    assert "APP_PASSWORD_HASH=pbkdf2_sha256$$" in captured.out
+    assert "SESSION_SECRET=" in captured.out
